@@ -13,7 +13,13 @@ const server = http.createServer(app);
 // Configure Socket.io with CORS
 const io = socketIo(server, {
   cors: {
-    origin: ["http://localhost:5173", "http://localhost:5174", "http://localhost:3000","https://live-polling-gules.vercel.app"],
+    origin: [
+      "http://localhost:5173", 
+      "http://localhost:5174", 
+      "http://localhost:3000",
+      "https://live-polling-gules.vercel.app",
+      "https://*.vercel.app"
+    ],
     methods: ["GET", "POST"],
     credentials: true
   }
@@ -22,7 +28,13 @@ const io = socketIo(server, {
 // Middleware
 app.use(helmet());
 app.use(cors({
-  origin: ["http://localhost:5173", "http://localhost:5174", "http://localhost:3000","https://live-polling-gules.vercel.app"],
+  origin: [
+    "http://localhost:5173", 
+    "http://localhost:5174", 
+    "http://localhost:3000",
+    "https://live-polling-gules.vercel.app",
+    "https://*.vercel.app"
+  ],
   credentials: true
 }));
 app.use(express.json({ limit: '10mb' }));
