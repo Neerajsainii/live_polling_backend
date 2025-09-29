@@ -1,0 +1,543 @@
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { v4: uuidv4 } = require('uuid'); 
+      });
+    }equire('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { v4: uuidv4 } = require('uuid');
+
+// Initialize Express app
+const app = express();
+const server = http.createServer(app);
+
+// Configure Socket.io with CORS
+const io = socketIo(server, {
+  cors: {
+    origin: ["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],
+    methods: ["GET", "POST"],
+    credentials: true
+  }
+});
+
+// Middleware
+app.use(helmet());
+app.use(cors({
+  origin: ["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],
+  credentials: true
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
+});
+app.use('/api', limiter);
+
+// In-memory data storage (in production, use a database)
+let polls = new Map();
+let pollHistory = [];
+let activeParticipants = new Map();
+let chatMessages = [];
+let kickedOutStudents = new Set();
+
+// Utility functions
+function generateRoomCode() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+function createPollResponse(poll, includeResponses = false) {
+  const response = {
+    id: poll.id,
+    question: poll.question,
+    options: poll.options,
+    duration: poll.duration,
+    isActive: poll.isActive,
+    timeLeft: poll.timeLeft,
+    startTime: poll.startTime,
+    endTime: poll.endTime,
+    results: poll.results || {}
+  };
+  
+  if (includeResponses) {
+    response.responses = poll.responses || {};
+    response.participantCount = Object.keys(poll.responses || {}).length;
+  }
+  
+  return response;
+}
+
+function calculateResults(poll) {
+  const results = {};
+  const responses = poll.responses || {};
+  const totalResponses = Object.keys(responses).length;
+
+  poll.options.forEach(option => {
+    const count = Object.values(responses).filter(response => response.answer === option).length;
+    results[option] = {
+      count,
+      percentage: totalResponses > 0 ? Math.round((count / totalResponses) * 100) : 0
+    };
+  });
+
+  return results;
+}
+
+// API Routes
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// Get current poll
+app.get('/api/poll/current', (req, res) => {
+  const activePoll = Array.from(polls.values()).find(poll => poll.isActive);
+  
+  if (!activePoll) {
+    return res.json({ poll: null });
+  }
+
+  res.json({ 
+    poll: createPollResponse(activePoll),
+    participants: Array.from(activeParticipants.values())
+  });
+});
+
+// Create a new poll (Teacher only)
+app.post('/api/poll/create', (req, res) => {
+  try {
+    const { question, options, duration = 60, teacherId, teacherName, correctAnswer } = req.body;
+
+    // Validation
+    if (!question || !options || !Array.isArray(options) || options.length < 2) {
+      return res.status(400).json({ 
+        error: 'Question and at least 2 options are required' 
+      });
+    }
+
+// Start a poll (Teacher only)
+app.post('/api/poll/:pollId/start', (req, res) => {
+  try {
+    const { pollId } = req.params;
+    const { teacherId } = req.body;
+
+    const poll = polls.get(pollId);
+    
+    if (!poll) {
+      return res.status(404).json({ error: 'Poll not found' });
+    }
+
+    if (poll.teacherId !== teacherId) {
+      return res.status(403).json({ error: 'Only the poll creator can start this poll' });
+    }
+
+    if (poll.isActive) {
+      return res.status(409).json({ error: 'Poll is already active' });
+    }
+
+    // Start the poll
+    poll.isActive = true;
+    poll.startTime = new Date().toISOString();
+    poll.endTime = new Date(Date.now() + poll.duration * 1000).toISOString();
+    poll.timeLeft = poll.duration;
+    poll.responses = {};
+
+    // Clear previous chat messages for new poll
+    chatMessages = [];
+
+    // Broadcast poll start to all clients
+    io.emit('pollStarted', {
+      poll: createPollResponse(poll),
+      participants: Array.from(activeParticipants.values())
+    });
+
+    // Start timer
+    const timer = setInterval(() => {
+      poll.timeLeft--;
+      
+      // Broadcast time update
+      io.emit('timerUpdate', { timeLeft: poll.timeLeft });
+
+      if (poll.timeLeft <= 0) {
+        clearInterval(timer);
+        endPoll(poll);
+      }
+    }, 1000);
+
+    res.json({ 
+      poll: createPollResponse(poll),
+      message: 'Poll started successfully'
+    });
+
+  } catch (error) {
+    console.error('Error starting poll:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Submit response (Student only)
+app.post('/api/poll/:pollId/response', (req, res) => {
+  try {
+    const { pollId } = req.params;
+    const { studentId, studentName, answer } = req.body;
+
+    const poll = polls.get(pollId);
+
+    if (!poll) {
+      return res.status(404).json({ error: 'Poll not found' });
+    }
+
+    if (!poll.isActive) {
+      return res.status(409).json({ error: 'Poll is not active' });
+    }
+
+    if (!studentId || !studentName || !answer) {
+      return res.status(400).json({ error: 'Student ID, name, and answer are required' });
+    }
+
+    // Check if student is kicked out
+    if (kickedOutStudents.has(studentId)) {
+      return res.status(403).json({ error: 'You have been removed from this session' });
+    }
+
+    // Check if answer is valid
+    if (!poll.options.includes(answer)) {
+      return res.status(400).json({ error: 'Invalid answer option' });
+    }
+
+    // Check if student already answered
+    if (poll.responses[studentId]) {
+      return res.status(409).json({ error: 'You have already submitted an answer for this poll' });
+    }
+
+    // Add response
+    poll.responses[studentId] = {
+      answer,
+      studentName,
+      timestamp: new Date().toISOString()
+    };
+
+    // Update participant list
+    activeParticipants.set(studentId, {
+      id: studentId,
+      name: studentName,
+      hasAnswered: true,
+      joinedAt: activeParticipants.get(studentId)?.joinedAt || new Date().toISOString()
+    });
+
+    // Calculate live results
+    poll.results = calculateResults(poll);
+
+    // Broadcast updated results
+    io.emit('responseSubmitted', {
+      poll: createPollResponse(poll),
+      results: poll.results,
+      participants: Array.from(activeParticipants.values()),
+      responseCount: Object.keys(poll.responses).length
+    });
+
+    // Check if all participants have answered
+    const totalParticipants = Array.from(activeParticipants.values()).filter(p => !kickedOutStudents.has(p.id)).length;
+    const responseCount = Object.keys(poll.responses).length;
+
+    if (responseCount >= totalParticipants && totalParticipants > 0) {
+      // All participants have answered, end poll early
+      setTimeout(() => endPoll(poll), 1000); // Small delay for UI updates
+    }
+
+    res.json({
+      message: 'Response submitted successfully',
+      results: poll.results,
+      hasAnswered: true
+    });
+
+  } catch (error) {
+    console.error('Error submitting response:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get poll results
+app.get('/api/poll/:pollId/results', (req, res) => {
+  try {
+    const { pollId } = req.params;
+    const poll = polls.get(pollId);
+
+    if (!poll) {
+      return res.status(404).json({ error: 'Poll not found' });
+    }
+
+    const results = calculateResults(poll);
+    poll.results = results;
+
+    res.json({
+      poll: createPollResponse(poll),
+      results,
+      participants: Array.from(activeParticipants.values()),
+      totalResponses: Object.keys(poll.responses || {}).length
+    });
+
+  } catch (error) {
+    console.error('Error getting results:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Join as participant (Student)
+app.post('/api/participant/join', (req, res) => {
+  try {
+    const { studentId, studentName } = req.body;
+
+    if (!studentId || !studentName) {
+      return res.status(400).json({ error: 'Student ID and name are required' });
+    }
+
+    // Check if student is kicked out
+    if (kickedOutStudents.has(studentId)) {
+      return res.status(403).json({ 
+        error: 'You have been removed from this session',
+        isKickedOut: true 
+      });
+    }
+
+    // Add to participants
+    activeParticipants.set(studentId, {
+      id: studentId,
+      name: studentName.trim(),
+      hasAnswered: false,
+      joinedAt: new Date().toISOString()
+    });
+
+    // Broadcast participant joined
+    io.emit('participantJoined', {
+      participant: activeParticipants.get(studentId),
+      participants: Array.from(activeParticipants.values())
+    });
+
+    res.json({
+      message: 'Successfully joined as participant',
+      participant: activeParticipants.get(studentId),
+      participants: Array.from(activeParticipants.values())
+    });
+
+  } catch (error) {
+    console.error('Error joining participant:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get poll history
+app.get('/api/polls/history', (req, res) => {
+  try {
+    res.json({
+      polls: pollHistory.map(poll => ({
+        ...createPollResponse(poll, true),
+        results: poll.results,
+        totalResponses: Object.keys(poll.responses || {}).length,
+        endedAt: poll.endedAt
+      }))
+    });
+  } catch (error) {
+    console.error('Error getting poll history:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get chat messages
+app.get('/api/chat/messages', (req, res) => {
+  try {
+    res.json({ messages: chatMessages });
+  } catch (error) {
+    console.error('Error getting chat messages:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Helper function to end poll
+function endPoll(poll) {
+  poll.isActive = false;
+  poll.timeLeft = 0;
+  poll.endTime = new Date().toISOString();
+  poll.endedAt = poll.endTime;
+  poll.results = calculateResults(poll);
+
+  // Add to history
+  pollHistory.unshift({ ...poll });
+
+  // Reset participant answer status for next poll
+  for (let [id, participant] of activeParticipants.entries()) {
+    participant.hasAnswered = false;
+    activeParticipants.set(id, participant);
+  }
+
+  // Broadcast poll ended
+  io.emit('pollEnded', {
+    poll: createPollResponse(poll),
+    results: poll.results,
+    participants: Array.from(activeParticipants.values())
+  });
+}
+
+// Socket.io connection handling
+io.on('connection', (socket) => {
+  console.log(`Client connected: ${socket.id}`);
+
+  // Handle participant joining
+  socket.on('joinParticipant', (data) => {
+    const { studentId, studentName } = data;
+    
+    if (kickedOutStudents.has(studentId)) {
+      socket.emit('kickedOut', { 
+        reason: 'You have been removed from this session' 
+      });
+      return;
+    }
+
+    activeParticipants.set(studentId, {
+      id: studentId,
+      name: studentName,
+      hasAnswered: false,
+      socketId: socket.id,
+      joinedAt: new Date().toISOString()
+    });
+
+    socket.join('participants');
+    
+    // Send current poll state
+    const activePoll = Array.from(polls.values()).find(poll => poll.isActive);
+    if (activePoll) {
+      socket.emit('currentPoll', {
+        poll: createPollResponse(activePoll),
+        participants: Array.from(activeParticipants.values())
+      });
+    }
+
+    // Broadcast participant joined
+    io.emit('participantUpdate', {
+      participants: Array.from(activeParticipants.values())
+    });
+  });
+
+  // Handle teacher joining
+  socket.on('joinTeacher', (data) => {
+    socket.join('teachers');
+    
+    // Send current state
+    const activePoll = Array.from(polls.values()).find(poll => poll.isActive);
+    socket.emit('currentPoll', {
+      poll: activePoll ? createPollResponse(activePoll) : null,
+      participants: Array.from(activeParticipants.values()),
+      chatMessages
+    });
+  });
+
+  // Handle chat messages
+  socket.on('sendMessage', (data) => {
+    const { message, senderName, senderRole, senderId } = data;
+    
+    // Check if sender is kicked out (for students)
+    if (senderRole === 'student' && kickedOutStudents.has(senderId)) {
+      return;
+    }
+
+    const chatMessage = {
+      id: uuidv4(),
+      message: message.trim(),
+      senderName,
+      senderRole,
+      senderId,
+      timestamp: new Date().toISOString()
+    };
+
+    chatMessages.push(chatMessage);
+
+    // Keep only last 100 messages
+    if (chatMessages.length > 100) {
+      chatMessages = chatMessages.slice(-100);
+    }
+
+    // Broadcast to all clients
+    io.emit('newMessage', chatMessage);
+  });
+
+  // Handle kick participant (Teacher only)
+  socket.on('kickParticipant', (data) => {
+    const { participantId, reason = 'Removed by teacher' } = data;
+    
+    // Add to kicked out list
+    kickedOutStudents.add(participantId);
+    
+    // Remove from active participants
+    const participant = activeParticipants.get(participantId);
+    if (participant) {
+      activeParticipants.delete(participantId);
+      
+      // Find their socket and disconnect them
+      const participantSocket = [...io.sockets.sockets.values()]
+        .find(s => s.id === participant.socketId);
+      
+      if (participantSocket) {
+        participantSocket.emit('kickedOut', { reason });
+        participantSocket.disconnect();
+      }
+
+      // Broadcast participant removed
+      io.emit('participantRemoved', {
+        participantId,
+        participants: Array.from(activeParticipants.values())
+      });
+    }
+  });
+
+  // Handle disconnect
+  socket.on('disconnect', () => {
+    console.log(`Client disconnected: ${socket.id}`);
+    
+    // Remove participant if they disconnect
+    for (let [id, participant] of activeParticipants.entries()) {
+      if (participant.socketId === socket.id) {
+        activeParticipants.delete(id);
+        io.emit('participantUpdate', {
+          participants: Array.from(activeParticipants.values())
+        });
+        break;
+      }
+    }
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+// Start server
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`🚀 Live Polling Server running on port ${PORT}`);
+  console.log(`📊 API: http://localhost:${PORT}/api`);
+  console.log(`🔌 Socket.io: ws://localhost:${PORT}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
