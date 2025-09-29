@@ -1,0 +1,13 @@
+{
+  "name": "live-polling-api",
+  "version": "1.0.0",
+  "description": "API for live polling system",
+  "main": "index.js",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.1",
+    "helmet": "^7.2.0",
+    "uuid": "^9.0.1"
+  }
+}
